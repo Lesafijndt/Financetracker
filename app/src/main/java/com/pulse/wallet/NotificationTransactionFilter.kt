@@ -3,7 +3,7 @@ package com.pulse.wallet
 /** Conservative filters for bank alerts that should not reduce spending totals. */
 object NotificationTransactionFilter {
     private val selfTransfer = Regex(
-        "(?i)(?:\\bbetween\\s+(?:(?:my|your|own)\\s+)?(?:own\\s+)?(?:bank\\s+)?(?:accounts?|cards?)\\b"
+        "(?iu)(?:\\bbetween\\s+(?:(?:my|your|own)\\s+)?(?:own\\s+)?(?:bank\\s+)?(?:accounts?|cards?)\\b"
             + "|\\bto\\s+(?:(?:my|your)\\s+)?own\\s+(?:account|card)\\b"
             + "|\\bto\\s+(?:my|your)\\s+(?:account|card)\\b"
             + "|\\btransfer\\b.{0,30}\\bmyself\\b"
@@ -15,13 +15,13 @@ object NotificationTransactionFilter {
             + "|\\u043D\\u0430\\s+\\u0441\\u0432\\u043E\\u0439\\s+\\u0441\\u0447\\u0435\\u0442\\u0430?))"
     )
     private val incomingMoney = Regex(
-        "(?i)\\b(?:received|incoming|deposit(?:ed)?|credited|top[ -]?up|alimentare|\\u00EEncasare|incasare|creditare|primit(?:\\u0103|a)?|"
+        "(?iu)\\b(?:received|incoming|deposit(?:ed)?|credited|top[ -]?up|alimentare|\\u00EEncasare|incasare|creditare|primit(?:\\u0103|a)?|"
             + "\\u0437\\u0430\\u0447\\u0438\\u0441\\u043B\\u0435\\u043D\\u0438\\u0435|\\u0437\\u0430\\u0447\\u0438\\u0441\\u043B\\u0435\\u043D|"
             + "\\u043F\\u043E\\u043F\\u043E\\u043B\\u043D\\u0435\\u043D\\u0438\\u0435|\\u043F\\u043E\\u043B\\u0443\\u0447\\u0435\\u043D)\\b"
     )
-    private val refund = Regex("(?i)\\b(?:refund(?:ed)?|reversal|cashback|rambursare|rambursat|restituire|returnare|\\u0432\\u043E\\u0437\\u0432\\u0440\\u0430\\u0442|\\u0432\\u043E\\u0437\\u0432\\u0440\\u0430\\u0449\\u0451\\u043D)\\b")
+    private val refund = Regex("(?iu)\\b(?:refund(?:ed)?|reversal|cashback|rambursare|rambursat|restituire|returnare|\\u0432\\u043E\\u0437\\u0432\\u0440\\u0430\\u0442|\\u0432\\u043E\\u0437\\u0432\\u0440\\u0430\\u0449\\u0451\\u043D)\\b")
     private val notFinal = Regex(
-        "(?i)\\b(?:pending|pre[ -]?authori[sz]ation|declined|failed|rejected|cancelled|canceled|voided)\\b"
+        "(?iu)\\b(?:pending|pre[ -]?authori[sz]ation|declined|failed|rejected|cancelled|canceled|voided)\\b"
     )
 
     fun isSelfTransfer(text: String): Boolean = selfTransfer.containsMatchIn(text)
