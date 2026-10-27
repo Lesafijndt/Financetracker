@@ -17,6 +17,7 @@ object NotificationTextParser {
     )
     private val cardDetails = Regex("(?i)(?:\\b(?:with|using|card)\\s+)?(?:visa|mastercard)\\s+(?:[\\u2022\\u25CF\\u00B7]{2,}|\\*{2,})?\\s*\\d{4}\\b.*$")
     private val leadingConnector = Regex("(?i)^(?:at|to|la|c\\u0103tre|catre|merchant)\\s*[:,-]?\\s*")
+    private val merchantMarker = Regex("(?i)\\b(?:at|to|la|spre|către|catre|merchant)\\s*[:,-]?\\s*(.+)$")
     private val trailingStatus = Regex("(?i)\\s+(?:successful|completed|approved|efectuat(?:\\u0103|a)?|reusit(?:\\u0103|a)?|success)$")
     private val whitespace = Regex("\\s+")
 
@@ -25,7 +26,8 @@ object NotificationTextParser {
     fun merchant(title: String, body: String): String {
         val cleanTitle = title.trim()
         val source = if (cleanTitle.isNotEmpty() && !genericTitle.matches(cleanTitle)) cleanTitle else body
-        val candidate = removeBalanceAmounts(source)
+        val merchantSource = merchantMarker.find(source)?.groupValues?.getOrNull(1) ?: source
+        val candidate = removeBalanceAmounts(merchantSource)
             .replace(currencyAmount, " ")
             .replace(cardDetails, " ")
             .replace(leadingConnector, "")
