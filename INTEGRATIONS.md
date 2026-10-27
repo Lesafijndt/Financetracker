@@ -4,6 +4,10 @@
 
 This app can only make a best-effort attempt to read Google Wallet notifications through Android's notification listener. Google Pay's public Android API is a checkout API for merchants; it does not expose a consumer's Google Wallet payment history to this app. Notification capture can miss, duplicate, or misread payments, so review captured transactions against the bank statement.
 
+## Currency display
+
+Choose MDL, EUR, or USD from the currency chips; MDL is the default. The transaction list and summaries show the selected currency, and amounts in different currencies are not combined or converted using a fixed rate. Budget limits are saved separately per currency.
+
 ## MICB Mobile Banking and OTP Mobile Banking Moldova
 
 The app listens for visible transaction notifications from the Android packages `md.micb.mwb.prod` and `md.mobiasbanca.otpdirekt`. Enable transaction push notifications in each banking app and grant Android notification access to Pulse Wallet. This is notification parsing, not an authenticated transaction feed, and the bank can change notification text at any time.

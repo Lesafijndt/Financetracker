@@ -21,6 +21,11 @@ class MoneyAmountParserTest {
     }
 
     @Test
+    fun treatsMoldovanLeiTextAsMdl() {
+        assertEquals(ParsedMoney(-2500, "MDL"), MoneyAmountParser.parse("25.00 lei paid"))
+    }
+
+    @Test
     fun handlesRefundsAsCredits() {
         assertEquals(ParsedMoney(7525, "EUR"), MoneyAmountParser.parse("Refunded EUR 75.25"))
     }

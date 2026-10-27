@@ -11,16 +11,18 @@ object MoneyAmountParser {
     val supportedCurrencies = listOf("MDL", "EUR", "USD")
     private const val NUMBER = "(?:\\d{1,3}(?:[ \\u00A0\\u202F.,']\\d{3})+|\\d+)(?:[.,]\\d{1,2})?"
     private val amountWithCurrency = Regex(
-        "(?i)(?:([+-]?)\\s*(?:\\b(?:MDL|EUR|USD)\\b|[\\u20AC$])\\s*([+-]?$NUMBER)(?![\\d.,])|([+-]?$NUMBER)\\s*(?:\\b(?:MDL|EUR|USD)\\b|[\\u20AC$]))"
+        "(?i)(?:([+-]?)\\s*(?:\\b(?:MDL|EUR|USD|LEI|LEU|ЛЕЙ)\\b|[\\u20AC$])\\s*([+-]?$NUMBER)(?![\\d.,])|([+-]?$NUMBER)\\s*(?:\\b(?:MDL|EUR|USD|LEI|LEU|ЛЕЙ)\\b|[\\u20AC$]))"
     )
-    private val currencyCode = Regex("(?i)\\b(MDL|EUR|USD)\\b")
+    private val currencyCode = Regex("(?i)\\b(MDL|EUR|USD|LEI|LEU|ЛЕЙ)\\b")
     private val refundWords = Regex("(?i)\\b(refund(?:ed)?|reversal|reversed|cashback|rambursare|rambursat|restituire|returnare|\\u0432\\u043E\\u0437\\u0432\\u0440\\u0430\\u0442|\\u0432\\u043E\\u0437\\u0432\\u0440\\u0430\\u0449\\u0451\\u043D)\\b")
 
     fun parse(notificationText: String): ParsedMoney? {
         val match = amountWithCurrency.find(notificationText) ?: return null
         val prefixSign = match.groups[1]?.value.orEmpty()
         val rawNumber = (match.groups[2]?.value ?: match.groups[3]?.value) ?: return null
-        val currency = currencyCode.find(match.value)?.groupValues?.get(1)?.uppercase(Locale.ROOT)
+        val currency = currencyCode.find(match.value)?.groupValues?.get(1)?.uppercase(Locale.ROOT)?.let {
+            if (it in setOf("LEI", "LEU", "ЛЕЙ")) "MDL" else it
+        }
             ?: when {
                 '\u20AC' in match.value -> "EUR"
                 '$' in match.value -> "USD"
