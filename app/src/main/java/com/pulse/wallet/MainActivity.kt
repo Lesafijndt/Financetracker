@@ -404,7 +404,7 @@ object HybridCategorizer {
         """^(SQ\s?\*|SUMUP\s?\*|PAYPAL\s?\*|GOOGLE\s?\*|TST\*\s?|POS\s+|PLATA\s+LA\s+|PLATA\s+|ACHITARE\s+LA\s+|ACHITARE\s+|CUMPARATURA\s+|TRANZACTIE\s+LA\s+|ОПЛАТА\s+|ПОКУПКА\s+)""",
         RegexOption.IGNORE_CASE
     )
-    private val trailingNoiseRegex = Regex("""(\s+#\d+|\s+\d{4,}|\s+CHISINAU.*|\s+MDA.*)$""", RegexOption.IGNORE_CASE)
+    private val trailingNoiseRegex = Regex("""(\s+#\d+|\s+\d{4,}|\s+MDA.*)$""", RegexOption.IGNORE_CASE)
     private val transactionPrefixRegex = Regex(
         """(?iu)^(?:(?:POS|CARD|ONLINE)\s+)*(?:(?:CARD\s+)?(?:PURCHASE|PAYMENT|TRANSACTION)|P2P\s+TRANSFER|TRANSFER|PAID|SPENT|TRX|PLATA|TRANZACTIE|TRANZAC\u021BIE|OPERATION|OPERATIUNE)(?:\s+(?:AT|TO|BETWEEN|FROM|LA|CATRE|C\u0102TRE))?\s*[:#-]?\s*"""
     )
