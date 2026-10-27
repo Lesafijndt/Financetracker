@@ -13,8 +13,8 @@ android {
         applicationId = "com.pulse.wallet"
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 4
+        versionName = "4.0.0"
     }
 
     buildTypes {
@@ -48,6 +48,5 @@ dependencies {
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")
-    implementation("net.zetetic:sqlcipher-android:4.6.1@aar")
-    implementation("androidx.sqlite:sqlite-ktx:2.4.0")
+    testImplementation("junit:junit:4.13.2")
 }
