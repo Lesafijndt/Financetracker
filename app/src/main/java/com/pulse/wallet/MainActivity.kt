@@ -16,6 +16,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -54,7 +56,6 @@ import androidx.room.*
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.Flow
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
@@ -62,190 +63,15 @@ import java.util.*
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 import kotlin.math.abs
 import kotlin.math.max
-import kotlin.math.roundToLong
 
 // ============================================================================
 // 1. PERMANENT ROOM DATABASE (UNRESTRICTED HISTORY + RESET OPERATIONS)
 // ============================================================================
 
-@Entity(
-    tableName = "transactions",
-    indices = [Index(value = ["dedupHash"], unique = true)]
-)
-data class TransactionEntity(
-    @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val dedupHash: String,
-    val timestampMs: Long,
-    val rawMerchant: String,
-    val normalizedMerchant: String,
-    val amountMinorUnits: Long, // Negative = Expense/Transfer Out, Positive = Income/Top-up
-    val originalAmountMinorUnits: Long = amountMinorUnits,
-    val currency: String,
-    val originalCurrency: String = currency,
-    val cardLast4: String?,
-    val category: String,
-    val categorizationSource: String,
-    val encryptedMetadata: String? = null,
-    val sourceApp: String = "WALLET", // WALLET, MICB, OTP, UP, CASH
-    val txType: String = "EXPENSE",   // EXPENSE, TRANSFER, INCOME
-    val isSimulated: Boolean = false,
-    @ColumnInfo(defaultValue = "''") val notificationKeyHash: String = ""
-)
-
-@Entity(tableName = "merchant_rules")
-data class MerchantRuleEntity(
-    @PrimaryKey val normalizedMerchant: String,
-    val targetCategory: String
-)
-
-@Dao
-interface WalletDao {
-    @Query("SELECT * FROM transactions ORDER BY timestampMs DESC")
-    fun observeAllTransactions(): Flow<List<TransactionEntity>>
-
-    @Query("SELECT * FROM transactions ORDER BY timestampMs DESC")
-    suspend fun getAllTransactionsOnce(): List<TransactionEntity>
-
-    @Query("SELECT * FROM merchant_rules ORDER BY normalizedMerchant ASC")
-    fun observeAllRules(): Flow<List<MerchantRuleEntity>>
-
-    @Query("""
-        SELECT * FROM transactions
-        WHERE (notificationKeyHash = :notificationKeyHash
-            OR instr('|' || notificationKeyHash || '|', '|' || :notificationKeyHash || '|') > 0)
-          AND normalizedMerchant = :normalizedMerchant
-          AND amountMinorUnits = :amountMinorUnits
-          AND currency = :currency
-          AND timestampMs BETWEEN :fromTimestampMs AND :toTimestampMs
-          AND (cardLast4 IS NULL OR :cardLast4 IS NULL OR cardLast4 = :cardLast4)
-        LIMIT 1
-    """)
-    suspend fun findSameNotificationDuplicate(
-        notificationKeyHash: String,
-        normalizedMerchant: String,
-        amountMinorUnits: Long,
-        currency: String,
-        fromTimestampMs: Long,
-        toTimestampMs: Long,
-        cardLast4: String?
-    ): TransactionEntity?
-
-    @Query("""
-        SELECT * FROM transactions
-        WHERE isSimulated = 0
-          AND sourceApp != 'CASH'
-          AND instr('+' || sourceApp || '+', '+' || :captureSource || '+') = 0
-          AND normalizedMerchant = :normalizedMerchant
-          AND amountMinorUnits = :amountMinorUnits
-          AND currency = :currency
-          AND txType = :txType
-          AND timestampMs BETWEEN :fromTimestampMs AND :toTimestampMs
-          AND (cardLast4 IS NULL OR :cardLast4 IS NULL OR cardLast4 = :cardLast4)
-        LIMIT 1
-    """)
-    suspend fun findCrossSourceDuplicate(
-        captureSource: String,
-        normalizedMerchant: String,
-        amountMinorUnits: Long,
-        currency: String,
-        txType: String,
-        fromTimestampMs: Long,
-        toTimestampMs: Long,
-        cardLast4: String?
-    ): TransactionEntity?
-
-    @Query("""
-        UPDATE transactions
-        SET sourceApp = CASE
-                WHEN instr('+' || sourceApp || '+', '+' || :captureSource || '+') > 0 THEN sourceApp
-                ELSE sourceApp || '+' || :captureSource
-            END,
-            notificationKeyHash = CASE
-                WHEN :notificationKeyHash = '' OR notificationKeyHash = :notificationKeyHash
-                    OR instr('|' || notificationKeyHash || '|', '|' || :notificationKeyHash || '|') > 0
-                    THEN notificationKeyHash
-                WHEN notificationKeyHash = '' THEN :notificationKeyHash
-                ELSE notificationKeyHash || '|' || :notificationKeyHash
-            END
-        WHERE id = :transactionId
-    """)
-    suspend fun recordAdditionalCapture(transactionId: Long, captureSource: String, notificationKeyHash: String)
-
-    @Insert(onConflict = OnConflictStrategy.IGNORE)
-    suspend fun insertTransaction(tx: TransactionEntity): Long
-
-    @Transaction
-    suspend fun insertDeduplicated(tx: TransactionEntity, dedupeWindowMs: Long): Boolean {
-        if (tx.isSimulated) {
-            return insertTransaction(tx) != -1L
-        }
-        val repeatedNotification = tx.notificationKeyHash.takeIf { it.isNotBlank() }?.let {
-            findSameNotificationDuplicate(
-                it,
-                tx.normalizedMerchant,
-                tx.amountMinorUnits,
-                tx.currency,
-                tx.timestampMs - dedupeWindowMs,
-                tx.timestampMs + dedupeWindowMs,
-                tx.cardLast4
-            )
-        }
-        if (repeatedNotification != null) return false
-
-        val crossSourceDuplicate = findCrossSourceDuplicate(
-            tx.sourceApp,
-            tx.normalizedMerchant,
-            tx.amountMinorUnits,
-            tx.currency,
-            tx.txType,
-            tx.timestampMs - dedupeWindowMs,
-            tx.timestampMs + dedupeWindowMs,
-            tx.cardLast4
-        )
-        if (crossSourceDuplicate != null) {
-            recordAdditionalCapture(crossSourceDuplicate.id, tx.sourceApp, tx.notificationKeyHash)
-            return false
-        }
-        return insertTransaction(tx) != -1L
-    }
-
-    @Update
-    suspend fun updateTransaction(tx: TransactionEntity)
-
-    @Delete
-    suspend fun deleteTransaction(tx: TransactionEntity)
-
-    @Query("DELETE FROM transactions")
-    suspend fun deleteAllTransactions()
-
-    @Query("DELETE FROM transactions WHERE isSimulated = 1")
-    suspend fun deleteSimulatedTransactions()
-
-    @Query("DELETE FROM transactions WHERE sourceApp LIKE '%' || :source || '%'")
-    suspend fun deleteBySourceApp(source: String)
-
-    @Query("DELETE FROM transactions WHERE txType = :txType")
-    suspend fun deleteByTransactionType(txType: String)
-
-    @Query("DELETE FROM transactions WHERE timestampMs >= :startMs AND timestampMs <= :endMs")
-    suspend fun deleteTransactionsInRange(startMs: Long, endMs: Long)
-
-    @Query("UPDATE transactions SET category = :category, categorizationSource = 'USER_RULE' WHERE normalizedMerchant = :merchant")
-    suspend fun updateCategoryForMerchant(merchant: String, category: String)
-
-    @Query("SELECT * FROM merchant_rules WHERE normalizedMerchant = :merchant LIMIT 1")
-    suspend fun findRule(merchant: String): MerchantRuleEntity?
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertRule(rule: MerchantRuleEntity)
-
-    @Query("DELETE FROM merchant_rules")
-    suspend fun deleteAllRules()
-}
-
-@Database(entities = [TransactionEntity::class, MerchantRuleEntity::class], version = 4, exportSchema = false)
+@Database(entities = [TransactionEntity::class, MerchantRuleEntity::class, CaptureReceiptEntity::class], version = 5, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun dao(): WalletDao
 
@@ -257,6 +83,18 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE transactions ADD COLUMN captureState TEXT NOT NULL DEFAULT 'CONFIRMED'")
+                database.execSQL("ALTER TABLE transactions ADD COLUMN reviewReason TEXT NOT NULL DEFAULT ''")
+                database.execSQL("ALTER TABLE transactions ADD COLUMN userConfirmed INTEGER NOT NULL DEFAULT 0")
+                database.execSQL("UPDATE transactions SET userConfirmed = 1 WHERE categorizationSource IN ('MANUAL', 'USER_EDIT')")
+                database.execSQL("CREATE TABLE IF NOT EXISTS capture_receipts (eventId TEXT NOT NULL, transactionId INTEGER NOT NULL, PRIMARY KEY(eventId))")
+                // Previously guessed transfers must not stay counted as spending after upgrading.
+                database.execSQL("UPDATE transactions SET captureState = 'REVIEW', reviewReason = 'Check whether this earlier transfer was between your own accounts.' WHERE txType = 'TRANSFER' AND sourceApp != 'CASH' AND isSimulated = 0 AND categorizationSource NOT IN ('MANUAL', 'USER_EDIT')")
+            }
+        }
+
         fun get(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 Room.databaseBuilder(
@@ -264,7 +102,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "pulse_wallet.db"
                 )
-                    .addMigrations(MIGRATION_3_4)
+                    .addMigrations(MIGRATION_3_4, MIGRATION_4_5)
                     .build()
                     .also { INSTANCE = it }
             }
@@ -296,6 +134,15 @@ object HardwareCryptoManager {
         }
         return keyStore.getKey(KEY_ALIAS, null) as SecretKey
     }
+
+    fun decryptPayload(payload: String?): String? = try {
+        val parts = payload.orEmpty().split(':')
+        if (parts.size != 2) null else {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(128, Base64.getDecoder().decode(parts[0])))
+            String(cipher.doFinal(Base64.getDecoder().decode(parts[1])), Charsets.UTF_8)
+        }
+    } catch (_: Exception) { null }
 
     fun encryptPayload(plainText: String): String {
         return try {
@@ -502,7 +349,8 @@ object HybridCategorizer {
     }
 
     suspend fun refreshSingleTransaction(dao: WalletDao, tx: TransactionEntity) {
-        val (normalized, category, source) = categorize(dao, tx.rawMerchant, tx.txType, tx.sourceApp)
+        val merchant = if (tx.userConfirmed) tx.normalizedMerchant else tx.rawMerchant
+        val (normalized, category, source) = categorize(dao, merchant, tx.txType, tx.sourceApp)
         dao.updateTransaction(
             tx.copy(
                 normalizedMerchant = normalized,
@@ -522,7 +370,10 @@ object HybridCategorizer {
                 currency = tx.originalCurrency,
                 category = category,
                 categorizationSource = source,
-                txType = detectedType
+                txType = detectedType,
+                userConfirmed = false,
+                captureState = if (tx.notificationKeyHash.isNotBlank()) "REVIEW" else tx.captureState,
+                reviewReason = if (tx.notificationKeyHash.isNotBlank()) "Original notification values restored. Check and confirm before counting." else tx.reviewReason
             )
         )
     }
@@ -530,6 +381,7 @@ object HybridCategorizer {
     suspend fun refreshAllTransactions(dao: WalletDao): Int {
         val all = dao.getAllTransactionsOnce()
         for (tx in all) {
+            if (tx.userConfirmed || tx.categorizationSource == "USER_EDIT") continue
             val (normalized, category, source) = categorize(dao, tx.rawMerchant, tx.txType, tx.sourceApp)
             if (tx.normalizedMerchant != normalized || tx.category != category || tx.categorizationSource != source) {
                 dao.updateTransaction(
@@ -556,64 +408,17 @@ class WalletNotificationListener : NotificationListenerService() {
         @Volatile
         var instance: WalletNotificationListener? = null
 
-        private val LAST4_REGEX = Regex("""(?:••••|\*{2,4}|card|карта|ending in)\s*(\d{4})""", RegexOption.IGNORE_CASE)
-        private val MERCHANT_EXTRACT_REGEX = Regex(
-            """(?:la|at|to|spre|catre|в|на|comerciant:?|merchant:?)\s+([A-Za-z0-9А-Яа-яЁё*._\-\s#&']{2,35})""",
-            RegexOption.IGNORE_CASE
-        )
+        private val LAST4_REGEX = Regex("""(?iu)(?:[•●*]{2,}|(?:card(?:ul)?|карта|ending in)\s*[:*•-]?)\s*(\d{4})\b""")
 
-        fun detectSourceApp(packageName: String, title: String, text: String): String? {
-            val pkg = packageName.lowercase()
-            val combined = "$title $text".lowercase()
-            return when {
-                // Up Mobil Moldova (com.solde.md) & Up Mobil+ (com.upromania.superup / com.solde.ro)
-                pkg == "com.solde.md" || pkg == "com.solde.ro" || pkg == "com.upromania.superup" ||
-                    "upmoldova" in pkg || "up.mobil" in pkg ||
-                    "up mobil" in combined || "up moldova" in combined || "up dejun" in combined -> "UP"
-
-                // Google Wallet
-                pkg == "com.google.android.apps.walletnfcrel" ||
-                    (pkg == "com.google.android.gms" && ("wallet" in combined || "google pay" in combined)) -> "WALLET"
-
-                // Moldindconbank (MICB) and OTP Moldova banking apps
-                pkg == "md.micb.mwb.prod" -> "MICB"
-                pkg == "md.mobiasbanca.otpdirekt" -> "OTP"
-
-                else -> null
-            }
-        }
-
-        private fun normalizeCurrency(rawSym: String): String = when (rawSym.uppercase()) {
-            "€" -> "EUR"
-            "$" -> "USD"
-            "LEI", "ЛЕЙ", "MDL" -> "MDL"
-            else -> rawSym.uppercase()
-        }
+        fun detectSourceApp(packageName: String, title: String, text: String): String? =
+            NotificationSources.detect(packageName, "$title $text")
 
         fun parseAmountAndCurrency(text: String): Pair<Long, String>? =
             MoneyAmountParser.parse(NotificationTextParser.removeBalanceAmounts(text))
                 ?.let { kotlin.math.abs(it.amountMinorUnits) to it.currency }
 
-        fun extractMerchantName(sourceApp: String, rawTitle: String, rawText: String): String {
-            if (sourceApp == "WALLET") return rawTitle
-            val cleanedText = rawText
-                .replace(Regex("""\d+[.,]\d{2}\s*(MDL|EUR|USD|LEI|ЛЕЙ)""", RegexOption.IGNORE_CASE), "")
-                .replace(Regex("""(Sold disponibil|Disponibil|Balance|Остаток).*""", RegexOption.IGNORE_CASE), "")
-                .trim()
-
-            MERCHANT_EXTRACT_REGEX.find(rawText)?.groupValues?.getOrNull(1)?.trim()?.let { extracted ->
-                val stopWords = Regex("""\s+(cu cardul|card|sold|disponibil|la data).*""", RegexOption.IGNORE_CASE)
-                val cleanExtracted = extracted.replace(stopWords, "").trim()
-                if (cleanExtracted.length >= 2) return cleanExtracted
-            }
-
-            val titleLower = rawTitle.lowercase()
-            val isGenericBankTitle = listOf("micb", "moldindcon", "otp", "up mobil", "up moldova", "up dejun").any { it in titleLower }
-            if (!isGenericBankTitle && rawTitle.length >= 2) {
-                return rawTitle
-            }
-            return cleanedText.take(36).ifBlank { "$sourceApp Transaction" }
-        }
+        private fun sha256(text: String) = MessageDigest.getInstance("SHA-256")
+            .digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
         suspend fun processAndStore(
             context: Context,
@@ -624,93 +429,70 @@ class WalletNotificationListener : NotificationListenerService() {
             isSimulated: Boolean = false,
             notificationKey: String? = null
         ): Boolean {
-            val combined = "$rawTitle $rawText"
-            if (!isSimulated) {
-                if (NotificationTransactionFilter.isSelfTransfer(combined)) return false
-                if (NotificationTransactionFilter.isNotFinal(combined)) return false
-                if (sourceApp != "WALLET" && NotificationTransactionFilter.shouldIgnoreBankNotification(combined)) return false
+            val combined = "$rawTitle\n$rawText"
+            val notificationKeyHash = notificationKey?.let(::sha256).orEmpty()
+            val eventId = sha256("$sourceApp|$notificationKeyHash|$timestampMs" +
+                if (notificationKey == null) "|$combined" else "")
+            val dao = AppDatabase.get(context).dao()
+            val decision = NotificationCaptureParser.parse(sourceApp, rawTitle, rawText)
+            if (decision == null) {
+                if (NotificationTransactionFilter.isSelfTransfer(combined) || NotificationTransactionFilter.isNotFinal(combined)) {
+                    dao.reconcileExcludedEvent(eventId, NotificationTransactionFilter.isSelfTransfer(combined))
+                }
+                return false
             }
-
-            val parsedMoney = MoneyAmountParser.parse(NotificationTextParser.removeBalanceAmounts(combined)) ?: return false
-            val absAmountMinor = kotlin.math.abs(parsedMoney.amountMinorUnits)
-            if (absAmountMinor <= 0L) return false
-
-            val txType = when {
-                parsedMoney.amountMinorUnits > 0 -> "INCOME"
-                else -> HybridCategorizer.detectTransactionType(combined)
-            }
-            val signedAmountMinor = if (txType == "INCOME") absAmountMinor else -absAmountMinor
-            val last4 = LAST4_REGEX.find(combined)?.groupValues?.getOrNull(1)
-            val parsedMerchant = NotificationTextParser.merchant(rawTitle, rawText)
-            val extractedMerchant = parsedMerchant.takeIf { it.isNotBlank() }
-                ?: extractMerchantName(sourceApp, rawTitle, rawText)
-
-            val db = AppDatabase.get(context)
-            val dao = db.dao()
-            val (normalized, category, catSource) = HybridCategorizer.categorize(dao, extractedMerchant, txType, sourceApp)
-            val notificationKeyHash = notificationKey?.let {
-                MessageDigest.getInstance("SHA-256").digest(it.toByteArray(Charsets.UTF_8))
-                    .joinToString("") { byte -> "%02x".format(byte) }
-            }.orEmpty()
-            val dedupHash = MessageDigest.getInstance("SHA-256")
-                .digest("$sourceApp|$notificationKeyHash|$timestampMs|$normalized|$signedAmountMinor|${parsedMoney.currency}|${last4.orEmpty()}".toByteArray(Charsets.UTF_8))
-                .joinToString("") { "%02x".format(it) }
-
+            val parsedMoney = decision.money
+            val signedAmountMinor = parsedMoney?.amountMinorUnits ?: 0L
+            val currency = parsedMoney?.currency ?: BudgetPrefs.getCurrency(context)
+            val last4 = LAST4_REGEX.findAll(combined).map { it.groupValues[1] }.distinct().singleOrNull()
+            val (normalized, category, catSource) = HybridCategorizer.categorize(dao, decision.merchant, decision.type, sourceApp)
             val row = TransactionEntity(
-                dedupHash = dedupHash,
+                dedupHash = eventId,
                 timestampMs = timestampMs,
-                rawMerchant = extractedMerchant,
+                rawMerchant = decision.merchant,
                 normalizedMerchant = normalized,
                 amountMinorUnits = signedAmountMinor,
                 originalAmountMinorUnits = signedAmountMinor,
-                currency = parsedMoney.currency,
-                originalCurrency = parsedMoney.currency,
+                currency = currency,
+                originalCurrency = currency,
                 cardLast4 = last4,
                 category = category,
                 categorizationSource = catSource,
                 encryptedMetadata = HardwareCryptoManager.encryptPayload(combined),
                 sourceApp = sourceApp,
-                txType = txType,
+                txType = decision.type,
                 isSimulated = isSimulated,
-                notificationKeyHash = notificationKeyHash
+                notificationKeyHash = notificationKeyHash,
+                captureState = if (decision.needsReview) "REVIEW" else "CONFIRMED",
+                reviewReason = decision.reviewReason
             )
-            return dao.insertDeduplicated(row, CROSS_SOURCE_DEDUPE_WINDOW_MS)
+            return dao.insertDeduplicated(row, CROSS_SOURCE_DEDUPE_WINDOW_MS, eventId)
         }
 
         private const val CROSS_SOURCE_DEDUPE_WINDOW_MS = 180_000L
 
-        suspend fun scanActiveNotificationsAndRefreshAll(context: Context): Int {
-            val db = AppDatabase.get(context)
-            val dao = db.dao()
+        private suspend fun captureNotification(context: Context, sbn: StatusBarNotification): Boolean {
+            val notification = sbn.notification ?: return false
+            // Group summaries aggregate old transactions and must never become another purchase.
+            if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return false
+            val extras = notification.extras
+            val title = (extras.getCharSequence(Notification.EXTRA_TITLE_BIG)
+                ?: extras.getCharSequence(Notification.EXTRA_TITLE))?.toString()?.trim().orEmpty()
+            val body = NotificationTextParser.body(
+                extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString(),
+                extras.getCharSequence(Notification.EXTRA_TEXT)?.toString(),
+                extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.map { it.toString() }.orEmpty())
+            if (title.isBlank() && body.isBlank()) return false
+            val source = detectSourceApp(sbn.packageName, title, body) ?: return false
+            return processAndStore(context, source, title, body,
+                NotificationSources.eventTime(sbn.postTime, notification.`when`), notificationKey = sbn.key)
+        }
 
+        suspend fun scanActiveNotificationsAndRefreshAll(context: Context): Int {
+            val dao = AppDatabase.get(context).dao()
             instance?.let { service ->
-                try {
-                    val activeList = service.activeNotifications ?: emptyArray()
-                    for (sbn in activeList) {
-                        val extras = sbn.notification?.extras ?: continue
-                        val title = (extras.getCharSequence(Notification.EXTRA_TITLE)
-                            ?: extras.getCharSequence(Notification.EXTRA_TITLE_BIG))?.toString()?.trim().orEmpty()
-                        val fullText = buildList {
-                            listOf(
-                                Notification.EXTRA_TEXT,
-                                Notification.EXTRA_BIG_TEXT,
-                                Notification.EXTRA_SUB_TEXT,
-                                Notification.EXTRA_INFO_TEXT
-                            ).forEach { key ->
-                                extras.getCharSequence(key)?.toString()?.trim()?.takeIf(String::isNotEmpty)?.let(::add)
-                            }
-                            extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.forEach { line ->
-                                line?.toString()?.trim()?.takeIf(String::isNotEmpty)?.let(::add)
-                            }
-                        }.distinct().joinToString(" ")
-                        if (title.isBlank() && fullText.isBlank()) continue
-                        val source = detectSourceApp(sbn.packageName, title, fullText) ?: continue
-                        processAndStore(
-                            context, source, title, fullText, sbn.postTime,
-                            isSimulated = false, notificationKey = sbn.key
-                        )
-                    }
-                } catch (_: Exception) {
+                for (sbn in service.activeNotifications.orEmpty()) {
+                    captureNotification(context, sbn)
                 }
             }
             return HybridCategorizer.refreshAllTransactions(dao)
@@ -728,31 +510,15 @@ class WalletNotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        val notification = sbn?.notification ?: return
-        val extras = notification.extras
-        val title = (extras.getCharSequence(Notification.EXTRA_TITLE)
-            ?: extras.getCharSequence(Notification.EXTRA_TITLE_BIG))?.toString()?.trim().orEmpty()
-        val fullText = buildList {
-            listOf(
-                Notification.EXTRA_TEXT,
-                Notification.EXTRA_BIG_TEXT,
-                Notification.EXTRA_SUB_TEXT,
-                Notification.EXTRA_INFO_TEXT
-            ).forEach { key ->
-                extras.getCharSequence(key)?.toString()?.trim()?.takeIf(String::isNotEmpty)?.let(::add)
-            }
-            extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.forEach { line ->
-                line?.toString()?.trim()?.takeIf(String::isNotEmpty)?.let(::add)
-            }
-        }.distinct().joinToString(" ")
-        if (title.isBlank() && fullText.isBlank()) return
-        val sourceApp = detectSourceApp(sbn.packageName, title, fullText) ?: return
-
+        if (sbn == null) return
         scope.launch {
-            processAndStore(
-                applicationContext, sourceApp, title, fullText, sbn.postTime,
-                isSimulated = false, notificationKey = sbn.key
-            )
+            try {
+                captureNotification(applicationContext, sbn)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                // Do not log financial notification text. Leave the active alert available for a rescan.
+                android.util.Log.e("PulseCapture", "Unable to store notification", error)
+            }
         }
     }
 
@@ -773,7 +539,7 @@ class MainActivity : ComponentActivity() {
         val db = AppDatabase.get(this)
 
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            KiwiWalletTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     PulseWalletApp(dao = db.dao())
                 }
@@ -845,10 +611,11 @@ fun PulseWalletApp(dao: WalletDao) {
     }
 
     // Filter by source/type chip + search query
-    val visibleTransactions = remember(periodFilteredTransactions, selectedSourceFilter, searchQuery) {
+    val visibleTransactions = remember(periodFilteredTransactions, selectedSourceFilter, searchQuery, displayCurrency) {
         periodFilteredTransactions.filter { tx ->
             val matchesSource = when (selectedSourceFilter) {
                 "ALL" -> true
+                "REVIEW" -> tx.captureState == "REVIEW"
                 "TRANSFER" -> tx.txType == "TRANSFER"
                 "INCOME" -> tx.txType == "INCOME"
                 "CASH" -> "CASH" in tx.sourceApp
@@ -866,16 +633,13 @@ fun PulseWalletApp(dao: WalletDao) {
                     tx.sourceApp.lowercase().contains(q) ||
                     String.format(Locale.US, "%.2f", abs(tx.amountMinorUnits) / 100.0).contains(q)
             }
-            matchesSource && matchesSearch
+            matchesSource && matchesSearch && tx.currency == displayCurrency
         }
     }
 
     // Calculate spending, income, and net totals in user's displayCurrency
     val countableOutflows = remember(periodFilteredTransactions, includeTransfersInSpend, displayCurrency) {
-        periodFilteredTransactions.filter { tx ->
-            !tx.isSimulated && tx.currency == displayCurrency && tx.amountMinorUnits < 0 &&
-                (tx.txType == "EXPENSE" || (includeTransfersInSpend && tx.txType == "TRANSFER"))
-        }
+        TransactionAccounting.outflows(periodFilteredTransactions, displayCurrency, includeTransfersInSpend)
     }
 
     val totalSpentDisplayMinor = remember(countableOutflows) {
@@ -883,10 +647,7 @@ fun PulseWalletApp(dao: WalletDao) {
     }
 
     val totalIncomeDisplayMinor = remember(periodFilteredTransactions, displayCurrency) {
-        periodFilteredTransactions.filter {
-            !it.isSimulated && it.currency == displayCurrency &&
-                (it.amountMinorUnits > 0 || it.txType == "INCOME")
-        }.sumOf { abs(it.amountMinorUnits) }
+        TransactionAccounting.income(periodFilteredTransactions, displayCurrency)
     }
 
     val remainingMinor = (monthlyBudgetMinor - totalSpentDisplayMinor).coerceAtLeast(0L)
@@ -924,7 +685,7 @@ fun PulseWalletApp(dao: WalletDao) {
             if (selectedTab != 2) {
                 ExtendedFloatingActionButton(
                     onClick = { showAddManualDialog = true },
-                    containerColor = Color(0xFF4ECDC4),
+                    containerColor = KiwiPalette.Leaf,
                     contentColor = Color.Black
                 ) {
                     Icon(Icons.Default.Add, contentDescription = "Add")
@@ -946,23 +707,17 @@ fun PulseWalletApp(dao: WalletDao) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                KiwiBird(Modifier.size(48.dp))
+                Spacer(Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Pulse Wallet", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                     Text(
-                        "Wallet • MICB • OTP • Up Moldova • Cash",
+                        "Your kiwi money companion",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color.Gray
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    FilterChip(
-                        selected = showAllTime,
-                        onClick = {
-                            showAllTime = !showAllTime
-                            monthOffset = 0
-                        },
-                        label = { Text(if (showAllTime) "All-Time" else "Monthly") }
-                    )
                     IconButton(onClick = { showSearchBar = !showSearchBar }) {
                         Icon(Icons.Default.Search, contentDescription = "Search")
                     }
@@ -991,7 +746,6 @@ fun PulseWalletApp(dao: WalletDao) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("Currency", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
                 listOf("MDL", "EUR", "USD").forEach { currency ->
                     FilterChip(
                         selected = displayCurrency == currency,
@@ -1005,6 +759,22 @@ fun PulseWalletApp(dao: WalletDao) {
                         label = { Text(currency) }
                     )
                 }
+            }
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("Wallet · MICB · OTP · Up · Cash", style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                FilterChip(selected = showAllTime,
+                    onClick = { showAllTime = !showAllTime; monthOffset = 0 },
+                    label = { Text(if (showAllTime) "All time" else "Monthly") })
+            }
+
+            val reviewCount = allTransactions.count { it.captureState == "REVIEW" && it.currency == displayCurrency && !it.isSimulated }
+            if (reviewCount > 0) {
+                AssistChip(
+                    onClick = { selectedTab = 0; selectedSourceFilter = "REVIEW"; showAllTime = true; searchQuery = "" },
+                    label = { Text("$reviewCount need review · excluded from totals") }
+                )
             }
 
             // Month Selector Bar (when Monthly mode is active)
@@ -1083,7 +853,7 @@ fun PulseWalletApp(dao: WalletDao) {
                                 Text(
                                     if (showAllTime) "ALL-TIME SPENT vs BUDGET" else "$selectedMonthLabel SPENT",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = Color.Gray
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                                 Row {
                                     TextButton(
@@ -1118,7 +888,7 @@ fun PulseWalletApp(dao: WalletDao) {
                             LinearProgressIndicator(
                                 progress = { budgetProgress },
                                 modifier = Modifier.fillMaxWidth().height(8.dp),
-                                color = if (budgetProgress >= 0.85f) Color(0xFFFF6B6B) else Color(0xFF4ECDC4)
+                                color = if (budgetProgress >= 0.85f) Color(0xFFFF6B6B) else KiwiPalette.Leaf
                             )
                             Spacer(modifier = Modifier.height(6.dp))
                             Row(
@@ -1143,7 +913,7 @@ fun PulseWalletApp(dao: WalletDao) {
                                         dailyAverageBurnMinor / 100.0
                                     ),
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = Color.Gray
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                                 if (totalIncomeDisplayMinor > 0) {
                                     Text(
@@ -1170,6 +940,7 @@ fun PulseWalletApp(dao: WalletDao) {
                     ) {
                         val filters = listOf(
                             "ALL" to "All",
+                            "REVIEW" to "Needs review",
                             "UP" to "Up Moldova",
                             "MICB" to "Moldindconbank",
                             "OTP" to "OTP Bank",
@@ -1220,6 +991,20 @@ fun PulseWalletApp(dao: WalletDao) {
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         contentPadding = PaddingValues(bottom = 84.dp)
                     ) {
+                        if (visibleTransactions.isEmpty()) {
+                            item {
+                                Column(modifier = Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    KiwiBird(Modifier.size(88.dp))
+                                    Spacer(Modifier.height(12.dp))
+                                    Text(if (selectedSourceFilter == "REVIEW") "Your nest is all clear" else "No entries in $displayCurrency yet",
+                                        style = MaterialTheme.typography.titleMedium)
+                                    Spacer(Modifier.height(6.dp))
+                                    Text(if (selectedSourceFilter == "REVIEW") "Uncertain alerts appear here before they affect your totals."
+                                        else "Clear purchase alerts appear automatically. You can also add a cash entry.",
+                                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
                         items(visibleTransactions, key = { it.id }) { tx ->
                             val dateStr = remember(tx.timestampMs) {
                                 SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date(tx.timestampMs))
@@ -1250,11 +1035,14 @@ fun PulseWalletApp(dao: WalletDao) {
                                                 overflow = TextOverflow.Ellipsis
                                             )
                                         }
+                                        if (tx.captureState == "REVIEW") {
+                                            Text("Needs review · not counted", color = Color(0xFFFFCC80), style = MaterialTheme.typography.labelSmall)
+                                        }
                                         Spacer(modifier = Modifier.height(2.dp))
                                         Text(
                                             "${tx.category} • [${tx.sourceApp}] • $dateStr",
                                             style = MaterialTheme.typography.bodySmall,
-                                            color = Color.Gray
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
                                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1266,7 +1054,7 @@ fun PulseWalletApp(dao: WalletDao) {
                                         }
                                         val signPrefix = if (isPositive) "+" else ""
                                         Text(
-                                            text = String.format(
+                                            text = if (tx.captureState == "REVIEW" && tx.amountMinorUnits == 0L) "Amount needed" else String.format(
                                                 Locale.US,
                                                 "%s%s %.2f",
                                                 signPrefix,
@@ -1295,7 +1083,7 @@ fun PulseWalletApp(dao: WalletDao) {
                                                 Icons.Default.Refresh,
                                                 contentDescription = "Refresh Item",
                                                 modifier = Modifier.size(16.dp),
-                                                tint = Color.Gray
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
                                         }
                                         IconButton(
@@ -1326,7 +1114,7 @@ fun PulseWalletApp(dao: WalletDao) {
                     // ================================================================
                     SummaryAndCategoriesScreen(
                         transactions = countableOutflows,
-                        allPeriodTransactions = periodFilteredTransactions,
+                        allPeriodTransactions = periodFilteredTransactions.filter { it.captureState == "CONFIRMED" },
                         displayCurrency = displayCurrency,
                         totalSpentDisplayMinor = totalSpentDisplayMinor,
                         totalIncomeDisplayMinor = totalIncomeDisplayMinor,
@@ -1410,9 +1198,8 @@ fun PulseWalletApp(dao: WalletDao) {
             },
             confirmButton = {
                 Button(onClick = {
-                    val parsed = amountInput.replace(",", ".").toDoubleOrNull()
-                    if (parsed != null && parsed >= 0) {
-                        val newMinor = (parsed * 100).roundToLong()
+                    val newMinor = MoneyAmountParser.parseManualMinor(amountInput, allowZero = true) ?: return@Button
+                    run {
                         monthlyBudgetMinor = newMinor
                         displayCurrency = selectedCurr
                         BudgetPrefs.setBudgetMinor(context, selectedCurr, newMinor)
@@ -1444,7 +1231,7 @@ fun PulseWalletApp(dao: WalletDao) {
             title = { Text("Add Cash / Manual Entry") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Quick Presets:", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                    Text("Quick Presets:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         val presets = listOf(
                             Triple("Coffee", "Dining & Coffee", "CASH"),
@@ -1526,8 +1313,8 @@ fun PulseWalletApp(dao: WalletDao) {
             },
             confirmButton = {
                 Button(onClick = {
-                    val amountVal = amountInput.replace(",", ".").toDoubleOrNull() ?: 0.0
-                    if (amountVal > 0.0) {
+                    val amountMinor = MoneyAmountParser.parseManualMinor(amountInput)
+                    if (amountMinor != null) {
                         val rawName = merchantInput.ifBlank {
                             when (sourceInput) {
                                 "CASH" -> "Cash Purchase"
@@ -1536,7 +1323,7 @@ fun PulseWalletApp(dao: WalletDao) {
                             }
                         }
                         val normalized = HybridCategorizer.normalize(rawName)
-                        val absMinor = (amountVal * 100).roundToLong()
+                        val absMinor = amountMinor
                         val signedMinor = if (typeInput == "INCOME") absMinor else -absMinor
                         val now = System.currentTimeMillis()
                         val hash = UUID.randomUUID().toString()
@@ -1578,19 +1365,21 @@ fun PulseWalletApp(dao: WalletDao) {
     // ============================================================================
     editingTransaction?.let { tx ->
         var merchantEdit by remember(tx.id) { mutableStateOf(tx.normalizedMerchant) }
-        var amountEdit by remember(tx.id) { mutableStateOf(String.format(Locale.US, "%.2f", abs(tx.amountMinorUnits) / 100.0)) }
+        var amountEdit by remember(tx.id) { mutableStateOf(if (tx.amountMinorUnits == 0L) "" else String.format(Locale.US, "%.2f", abs(tx.amountMinorUnits) / 100.0)) }
         var currencyEdit by remember(tx.id) { mutableStateOf(tx.currency) }
         var sourceEdit by remember(tx.id) { mutableStateOf(tx.sourceApp) }
         var typeEdit by remember(tx.id) { mutableStateOf(tx.txType) }
         var categoryEdit by remember(tx.id) { mutableStateOf(tx.category) }
-        var saveRuleForFuture by remember(tx.id) { mutableStateOf(true) }
+        var saveRuleForFuture by remember(tx.id) { mutableStateOf(tx.captureState != "REVIEW") }
+        val originalNotification = remember(tx.encryptedMetadata) { HardwareCryptoManager.decryptPayload(tx.encryptedMetadata) }
 
         AlertDialog(
             onDismissRequest = { editingTransaction = null },
-            title = { Text("Edit / Reset Purchase") },
+            title = { Text(if (tx.captureState == "REVIEW") "Review transaction" else "Edit / Reset Purchase") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Raw original: ${tx.rawMerchant}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                Column(modifier = Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (tx.captureState == "REVIEW") Text(tx.reviewReason, color = Color(0xFFFFCC80))
+                    Text(originalNotification ?: "Raw original: ${tx.rawMerchant}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     OutlinedTextField(
                         value = merchantEdit,
                         onValueChange = { merchantEdit = it },
@@ -1650,6 +1439,14 @@ fun PulseWalletApp(dao: WalletDao) {
                         )
                         Text("Remember rule for this merchant", style = MaterialTheme.typography.bodySmall)
                     }
+                    if (!tx.isSimulated && tx.sourceApp != "CASH") {
+                        TextButton(onClick = {
+                            scope.launch(Dispatchers.IO) {
+                                dao.updateTransaction(tx.copy(captureState = "IGNORED", reviewReason = "Own transfer or ignored alert"))
+                            }
+                            editingTransaction = null
+                        }) { Text(if (typeEdit == "TRANSFER") "This is my own transfer — ignore" else "Ignore this alert / own transfer") }
+                    }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
@@ -1685,9 +1482,8 @@ fun PulseWalletApp(dao: WalletDao) {
                 }
             },
             confirmButton = {
-                Button(onClick = {
-                    val parsedAmt = amountEdit.replace(",", ".").toDoubleOrNull() ?: (abs(tx.amountMinorUnits) / 100.0)
-                    val absMinor = (parsedAmt * 100).roundToLong()
+                Button(enabled = MoneyAmountParser.parseManualMinor(amountEdit) != null && merchantEdit.isNotBlank(), onClick = {
+                    val absMinor = MoneyAmountParser.parseManualMinor(amountEdit) ?: return@Button
                     val signedMinor = if (typeEdit == "INCOME") absMinor else -absMinor
                     val cleanMerchant = merchantEdit.trim().ifBlank { tx.normalizedMerchant }
 
@@ -1700,7 +1496,10 @@ fun PulseWalletApp(dao: WalletDao) {
                                 sourceApp = sourceEdit,
                                 txType = typeEdit,
                                 category = categoryEdit,
-                                categorizationSource = "USER_EDIT"
+                                categorizationSource = "USER_EDIT",
+                                captureState = "CONFIRMED",
+                                reviewReason = "",
+                                userConfirmed = true
                             )
                         )
                         if (saveRuleForFuture) {
@@ -1710,7 +1509,7 @@ fun PulseWalletApp(dao: WalletDao) {
                     }
                     editingTransaction = null
                 }) {
-                    Text("Save")
+                    Text(if (tx.captureState == "REVIEW" && typeEdit == "TRANSFER") "Confirm external transfer" else if (tx.captureState == "REVIEW") "Confirm transaction" else "Save")
                 }
             },
             dismissButton = {
@@ -1798,7 +1597,7 @@ fun SummaryAndCategoriesScreen(
                     Text(
                         "OVERALL SPENDING SUMMARY",
                         style = MaterialTheme.typography.labelMedium,
-                        color = Color.Gray
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(modifier = Modifier.height(14.dp))
 
@@ -1834,7 +1633,7 @@ fun SummaryAndCategoriesScreen(
                         }
 
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("TOTAL SPENT", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                            Text("TOTAL SPENT", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text(
                                 text = String.format(Locale.US, "%s %.2f", displayCurrency, totalSpentDisplayMinor / 100.0),
                                 fontSize = 19.sp,
@@ -1843,7 +1642,7 @@ fun SummaryAndCategoriesScreen(
                             Text(
                                 text = "${transactions.size} purchases",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = Color.Gray
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
@@ -1856,7 +1655,7 @@ fun SummaryAndCategoriesScreen(
                         horizontalArrangement = Arrangement.SpaceEvenly
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("Income / Top-ups", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                            Text("Income / Top-ups", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text(
                                 String.format(Locale.US, "+%s %.2f", displayCurrency, totalIncomeDisplayMinor / 100.0),
                                 fontWeight = FontWeight.Bold,
@@ -1864,7 +1663,7 @@ fun SummaryAndCategoriesScreen(
                             )
                         }
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("Transfers (P2P/MIA)", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                            Text("Transfers (P2P/MIA)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text(
                                 String.format(Locale.US, "%s %.2f", displayCurrency, totalTransfersMinor / 100.0),
                                 fontWeight = FontWeight.Bold,
@@ -1872,7 +1671,7 @@ fun SummaryAndCategoriesScreen(
                             )
                         }
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("Net Cashflow", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                            Text("Net Cashflow", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             Text(
                                 String.format(Locale.US, "%s %.2f", displayCurrency, netCashflowMinor / 100.0),
                                 fontWeight = FontWeight.Bold,
@@ -1897,7 +1696,7 @@ fun SummaryAndCategoriesScreen(
         item {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(14.dp)) {
-                    Text("SPENDINGS BY BANK / PAYMENT APP", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
+                    Text("SPENDINGS BY BANK / PAYMENT APP", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(modifier = Modifier.height(8.dp))
                     sourceTotals.forEach { (src, amtMinor) ->
                         val label = when (src) {
@@ -1927,7 +1726,7 @@ fun SummaryAndCategoriesScreen(
             Text(
                 "SPENDINGS BY CATEGORY",
                 style = MaterialTheme.typography.labelMedium,
-                color = Color.Gray
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
@@ -1952,7 +1751,7 @@ fun SummaryAndCategoriesScreen(
                                 Text(
                                     "${item.txCount} transactions • ${String.format(Locale.US, "%.1f%%", item.shareFraction * 100f)}",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = Color.Gray
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -2002,7 +1801,7 @@ fun ResetAndToolsScreen(
         item {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("EXPORT & BACKUP", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
+                    Text("EXPORT & BACKUP", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(
                         "Export all ${allTransactions.size} saved transactions to CSV for Excel, Google Sheets, or backup.",
                         style = MaterialTheme.typography.bodySmall
@@ -2010,14 +1809,14 @@ fun ResetAndToolsScreen(
                     Button(
                         onClick = {
                             val csvBuilder = StringBuilder()
-                            csvBuilder.append("ID,Date,Merchant,RawMerchant,Category,SourceApp,Type,Amount,Currency,Simulated\n")
+                            csvBuilder.append("ID,Date,Merchant,RawMerchant,Category,SourceApp,Type,Amount,Currency,Simulated,CaptureState\n")
                             val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
                             allTransactions.forEach { tx ->
                                 val date = fmt.format(Date(tx.timestampMs))
                                 val amt = String.format(Locale.US, "%.2f", tx.amountMinorUnits / 100.0)
                                 val cleanMerch = tx.normalizedMerchant.replace(",", " ")
                                 val cleanRaw = tx.rawMerchant.replace(",", " ")
-                                csvBuilder.append("${tx.id},$date,$cleanMerch,$cleanRaw,${tx.category},${tx.sourceApp},${tx.txType},$amt,${tx.currency},${tx.isSimulated}\n")
+                                csvBuilder.append("${tx.id},$date,$cleanMerch,$cleanRaw,${tx.category},${tx.sourceApp},${tx.txType},$amt,${tx.currency},${tx.isSimulated},${tx.captureState}\n")
                             }
                             val sendIntent = Intent(Intent.ACTION_SEND).apply {
                                 type = "text/csv"
@@ -2039,7 +1838,7 @@ fun ResetAndToolsScreen(
         item {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("RESET BUDGET & AI RULES", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
+                    Text("RESET BUDGET & AI RULES", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     OutlinedButton(
                         onClick = onResetBudget,
                         modifier = Modifier.fillMaxWidth()
@@ -2068,11 +1867,11 @@ fun ResetAndToolsScreen(
         item {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("RESET / DELETE SPECIFIC PAYMENT SOURCES", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
+                    Text("RESET / DELETE SPECIFIC PAYMENT SOURCES", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(
                         "Delete entries from a specific bank/app or remove simulated test taps while keeping everything else intact:",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color.Gray
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
                     OutlinedButton(
@@ -2176,8 +1975,7 @@ fun ResetAndToolsScreen(
                 Button(
                     onClick = {
                         scope.launch(Dispatchers.IO) {
-                            dao.deleteAllTransactions()
-                            dao.deleteAllRules()
+                            dao.resetAllData()
                             withContext(Dispatchers.Main) {
                                 Toast.makeText(context, "All transactions and rules wiped", Toast.LENGTH_SHORT).show()
                             }

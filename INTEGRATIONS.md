@@ -12,9 +12,25 @@ Choose MDL, EUR, or USD from the currency chips; MDL is the default. The transac
 
 The app listens for visible transaction notifications from the Android packages `md.micb.mwb.prod` and `md.mobiasbanca.otpdirekt`. Enable transaction push notifications in each banking app and grant Android notification access to Pulse Wallet. This is notification parsing, not an authenticated transaction feed, and the bank can change notification text at any time.
 
-When two sources report the same currency, amount, normalized merchant, compatible card suffix, and a timestamp within three minutes, the app stores one transaction and remembers the matching sources and notification IDs. Repeated callbacks for a remembered notification are ignored. This reduces duplicates; it cannot prove two alerts describe the same purchase. Two genuine purchases with identical details close together can be merged, while differently worded merchant names or different amounts can still produce duplicates.
+## Capture accuracy and review
 
-An own-account transfer is ignored only when the notification explicitly identifies it as a transfer between the user's own accounts/cards or to their own account. If the alert omits that information, the app cannot reliably know who owns the destination. Incoming deposits and alerts marked pending, failed, declined, or cancelled are excluded from spending totals. Verify captured history against bank statements before relying on totals.
+Clear purchase alerts with one exact supported-currency amount and an identifiable merchant are recorded automatically. The parser removes amounts explicitly labelled as balances, handles decimal/grouping conventions without floating-point rounding, and does not pick the first amount when a notification contains fees, conversion amounts, or several transactions. It prefers Android's expanded text over the collapsed copy and skips notification group summaries. Only the known banking/Wallet app packages are trusted.
+
+Ambiguous amounts, missing merchants, unclear transaction direction, and possible duplicates go to **Needs review**. They are visible in the selected currency, show the original notification in the review dialog, and are excluded from every spending/income summary and budget until confirmed. If no amount is reliable, the amount field is left empty. Review state is included in CSV exports; only `CONFIRMED` entries belong in financial totals. Notification text stays encrypted on the device.
+
+Explicit own-account/card transfers in English, Romanian, and Russian are ignored. Every other detected transfer is held for review, because a recipient name or amount cannot establish ownership. Choose **This is my own transfer — ignore** to hide it permanently, or **Confirm external transfer** for money sent to someone else. The same ignore action is available on other captured alerts if the bank omitted the transfer label. Incoming deposits/credits and pending, failed, declined, or cancelled alerts are not automatically counted as spending. Refunds are handled as credits.
+
+A Wallet and bank alert with the same amount, currency, merchant identity, and a timestamp within three minutes can be paired once. Wallet's virtual card suffix may differ from the bank's physical card suffix, so suffix mismatch alone does not produce a second expense. Two bank sources are never merged, and several possible matches or inconsistent merchant labels require review. Separate same-source purchase events are preserved; a reused notification key with identical purchase details is reviewed rather than silently discarded or counted twice.
+
+Persistent event receipts remember both sides of a matched purchase. Replaying, reconnecting, rescanning, ignoring, or deleting an already captured event does not recreate it. If an event changes its amount/currency/type/merchant, the saved entry is marked for review instead of adding another purchase. Explicit user confirmations/corrections survive automatic recategorization. A factory reset intentionally clears receipts along with all history.
+
+Database version 5 preserves existing version 3/4 history and rules. Previously automatic transfers become review items on upgrade; manual/user-edited transactions keep their chosen status. Older incorrectly captured purchase amounts cannot be repaired safely without their bank evidence: inspect and correct or ignore those entries. No history is silently deleted or repriced.
+
+These safeguards cannot make notification capture a complete bank ledger. Missing/hidden alerts, unspecified destinations, delayed alerts, and bank format changes still require review against a bank statement. The app does not learn account ownership from names or matched amounts and does not claim direct bank access.
+
+## Kiwi design
+
+The existing purchases, summary/categories, and tools screens use a forest-and-sage palette, an original lightweight vector kiwi mascot, and an adaptive kiwi launcher icon (including Android themed icons). MDL remains the default, with EUR and USD selectable independently.
 
 ## Moldindconbank and OTP Bank Moldova
 
